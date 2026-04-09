@@ -1,0 +1,31 @@
+bundle:
+  name: lakepulse
+
+workspace:
+  host: https://e2-demo-field-eng.cloud.databricks.com/
+
+resources:
+  apps:
+    lakepulse:
+      name: lakepulse
+      description: "LakePulse — Native Databricks FinOps Suite"
+      source_code_path: .
+      config:
+        command:
+          - streamlit
+          - run
+          - app.py
+          - --server.port
+          - "8080"
+          - --server.address
+          - 0.0.0.0
+      permissions:
+        - level: CAN_USE
+          group_name: users
+
+environments:
+  development:
+    default: true
+  production:
+    workspace:
+      host: https://e2-demo-field-eng.cloud.databricks.com/
