@@ -88,8 +88,8 @@ def get_dbu_waste(warehouse_id: str = "") -> pd.DataFrame:
         return _sql(warehouse_id, """
             SELECT
                 COALESCE(u.usage_metadata.cluster_id, 'unknown')        AS cluster_id,
-                COALESCE(c.cluster_name, 'Unnamed')                     AS cluster_name,
-                COALESCE(c.owned_by, 'unknown')                         AS owner,
+                COALESCE(MAX(c.cluster_name), 'Unnamed')                AS cluster_name,
+                COALESCE(MAX(c.owned_by), 'unknown')                    AS owner,
                 u.sku_name,
                 u.billing_origin_product                                AS product,
                 ROUND(SUM(u.usage_quantity), 2)                        AS total_dbu,
@@ -101,7 +101,10 @@ def get_dbu_waste(warehouse_id: str = "") -> pd.DataFrame:
                    ON u.usage_metadata.cluster_id = c.cluster_id
             WHERE u.usage_start_time >= CURRENT_TIMESTAMP - INTERVAL 30 DAYS
               AND u.billing_origin_product = 'ALL_PURPOSE'
-            GROUP BY 1,2,3,4,5
+            GROUP BY
+                u.usage_metadata.cluster_id,
+                u.sku_name,
+                u.billing_origin_product
             ORDER BY total_dbu DESC
             LIMIT 50
         """)
@@ -135,14 +138,14 @@ def get_bottlenecks(warehouse_id: str = "") -> pd.DataFrame:
     if _is_live(warehouse_id):
         return _sql(warehouse_id, """
             SELECT
-                query_id,
+                statement_id                                                AS query_id,
                 SUBSTR(statement_text, 1, 120)                              AS query_snippet,
                 executed_by,
                 start_time,
                 ROUND(total_duration_ms / 60000.0, 2)                      AS duration_min,
-                ROUND(COALESCE(metrics.shuffle_read_bytes,  0) / 1e9, 3)   AS shuffle_read_gb,
-                ROUND(COALESCE(metrics.shuffle_write_bytes, 0) / 1e9, 3)   AS shuffle_write_gb,
-                ROUND(COALESCE(metrics.peak_memory_bytes,   0) / 1e9, 3)   AS peak_memory_gb
+                ROUND(COALESCE(shuffle_read_bytes,  0) / 1e9, 3)           AS shuffle_read_gb,
+                ROUND(COALESCE(written_bytes,        0) / 1e9, 3)           AS shuffle_write_gb,
+                ROUND(COALESCE(spilled_local_bytes,  0) / 1e9, 3)           AS peak_memory_gb
             FROM system.query.history
             WHERE start_time >= CURRENT_TIMESTAMP - INTERVAL 7 DAYS
               AND total_duration_ms > 60000
@@ -186,12 +189,12 @@ def get_job_history(warehouse_id: str = "") -> pd.DataFrame:
             SELECT
                 j.job_id,
                 j.run_id,
-                COALESCE(j.run_name, CONCAT('Job-', j.job_id))      AS job_name,
-                COALESCE(j.run_as, 'unknown')                        AS run_as,
-                j.period_start_time                                  AS trigger_time,
+                COALESCE(j.run_name, CONCAT('Job-', j.job_id))             AS job_name,
+                j.trigger_type,
+                j.period_start_time                                         AS trigger_time,
                 j.result_state,
-                ROUND(COALESCE(j.run_duration, 0) / 60000.0, 2)     AS duration_min,
-                ROUND(COALESCE(j.queued_duration, 0) / 60000.0, 2)  AS queue_min
+                ROUND(COALESCE(j.run_duration_seconds, 0) / 60.0, 2)      AS duration_min,
+                ROUND(COALESCE(j.queue_duration_seconds, 0) / 60.0, 2)    AS queue_min
             FROM system.lakeflow.job_run_timeline j
             WHERE j.period_start_time >= CURRENT_TIMESTAMP - INTERVAL 30 DAYS
               AND j.result_state IS NOT NULL
@@ -213,7 +216,7 @@ def get_job_history(warehouse_id: str = "") -> pd.DataFrame:
             "job_id":            f"{abs(hash(name)) % 9999:04d}",
             "run_id":            f"run-{i:05d}",
             "job_name":          name,
-            "run_as":            random.choice(users),
+            "trigger_type":      random.choice(["MANUAL","SCHEDULED","API"]),
             "trigger_time":      (now - timedelta(hours=float(rng.uniform(1, 720)))).isoformat(),
             "result_state":      random.choice(states),
             "duration_min":      round(dur, 2),
@@ -229,15 +232,15 @@ def get_data_popularity(warehouse_id: str = "") -> pd.DataFrame:
     if _is_live(warehouse_id):
         return _sql(warehouse_id, """
             SELECT
-                request_params.full_name_arg                               AS table_name,
+                request_params['full_name_arg']                            AS table_name,
                 COUNT(*)                                                    AS access_count,
                 MAX(event_time)                                             AS last_accessed,
-                COUNT(DISTINCT user_identity.email)                         AS unique_users,
-                DATEDIFF(DAY, MAX(event_time), CURRENT_TIMESTAMP)          AS days_since_access
+                COUNT(DISTINCT user_identity.email)                        AS unique_users,
+                DATEDIFF(DAY, MAX(event_time), CURRENT_TIMESTAMP)         AS days_since_access
             FROM system.access.audit
             WHERE action_name IN ('getTable','selectFromTable','createTableAsSelect')
               AND event_time >= CURRENT_TIMESTAMP - INTERVAL 90 DAYS
-              AND request_params.full_name_arg IS NOT NULL
+              AND request_params['full_name_arg'] IS NOT NULL
             GROUP BY 1
             ORDER BY access_count DESC
             LIMIT 100
