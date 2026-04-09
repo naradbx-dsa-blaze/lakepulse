@@ -466,9 +466,9 @@ with t3:
 
     st.subheader("At-Risk Runs — predicted to exceed job's p75 SLA")
     st.dataframe(
-        at_risk[["job_name","creator_user_name","trigger_time","duration_min","p75","delay_prob","risk"]]
+        at_risk[["job_name","run_as","trigger_time","duration_min","p75","delay_prob","risk"]]
           .rename(columns={
-              "job_name":"Job","creator_user_name":"Owner","trigger_time":"Triggered",
+              "job_name":"Job","run_as":"Owner","trigger_time":"Triggered",
               "duration_min":"Duration (min)","p75":"SLA p75 (min)",
               "delay_prob":"Delay Prob","risk":"Risk",
           })

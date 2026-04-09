@@ -186,16 +186,16 @@ def get_job_history(warehouse_id: str = "") -> pd.DataFrame:
             SELECT
                 j.job_id,
                 j.run_id,
-                COALESCE(j.run_name, CONCAT('Job-', j.job_id))   AS job_name,
-                j.creator_user_name,
-                j.trigger_time,
+                COALESCE(j.run_name, CONCAT('Job-', j.job_id))      AS job_name,
+                COALESCE(j.run_as, 'unknown')                        AS run_as,
+                j.period_start_time                                  AS trigger_time,
                 j.result_state,
-                ROUND(j.run_duration / 60000.0, 2)               AS duration_min,
-                ROUND(COALESCE(j.queued_time, 0) / 60000.0, 2)   AS queue_min
+                ROUND(COALESCE(j.run_duration, 0) / 60000.0, 2)     AS duration_min,
+                ROUND(COALESCE(j.queued_duration, 0) / 60000.0, 2)  AS queue_min
             FROM system.lakeflow.job_run_timeline j
             WHERE j.period_start_time >= CURRENT_TIMESTAMP - INTERVAL 30 DAYS
               AND j.result_state IS NOT NULL
-            ORDER BY j.trigger_time DESC
+            ORDER BY j.period_start_time DESC
             LIMIT 500
         """)
 
@@ -213,7 +213,7 @@ def get_job_history(warehouse_id: str = "") -> pd.DataFrame:
             "job_id":            f"{abs(hash(name)) % 9999:04d}",
             "run_id":            f"run-{i:05d}",
             "job_name":          name,
-            "creator_user_name": random.choice(users),
+            "run_as":            random.choice(users),
             "trigger_time":      (now - timedelta(hours=float(rng.uniform(1, 720)))).isoformat(),
             "result_state":      random.choice(states),
             "duration_min":      round(dur, 2),
