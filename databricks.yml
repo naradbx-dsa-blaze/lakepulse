@@ -12,6 +12,8 @@ resources:
       source_code_path: .
       config:
         command:
+          - python
+          - -m
           - streamlit
           - run
           - app.py
