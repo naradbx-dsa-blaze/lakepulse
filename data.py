@@ -4,13 +4,10 @@ LakePulse — data layer.
 All queries run against real Databricks system tables.
 Pass warehouse_id explicitly from the UI — no env var dependency at runtime.
 
-Sources for constants:
-  DBU pricing     → databricks.com/product/pricing (AWS list price, Sep 2024)
-  CO₂/kWh        → US EPA eGRID 2022 national average (0.386 kg CO₂/kWh)
-  kWh/DBU        → ~0.14 kWh estimated from AWS instance TDP / DBU mapping
-  Tree absorption → USDA Forest Service: ~48 lbs (21.8 kg) CO₂/tree/year
-  Spot discount   → AWS Spot pricing page: 70-90% typical; 70% used (conservative)
-  Job vs AP       → Databricks docs: job clusters have zero idle cost vs always-on AP
+Pricing sources:
+  DBU pricing  → databricks.com/product/pricing (Enterprise, pay-as-you-go, 2024)
+  Spot discount → AWS Spot Advisor / Azure Spot VMs: 70-90% typical (70% used — conservative)
+  Job cluster  → Databricks docs: job clusters have zero idle cost vs always-on all-purpose
 """
 import os
 import random
@@ -25,20 +22,15 @@ try:
 except ImportError:
     _HAS_SDK = False
 
-# ── Pricing & emission constants (sourced) ────────────────────────────────────
-# AWS list prices (Enterprise tier, pay-as-you-go, Sep 2024)
-DBU_PRICE = {
-    "ALL_PURPOSE": 0.55,   # $0.55/DBU — databricks.com/product/pricing
-    "JOBS":        0.20,   # $0.20/DBU
-    "DLT":         0.36,   # $0.36/DBU (Advanced)
-    "SQL":         0.22,   # $0.22/DBU
+# ── DBU list prices by cloud (databricks.com/product/pricing, Enterprise, 2024) ─
+# These are public list prices. Customers should override with their contracted rates.
+CLOUD_DBU_DEFAULTS = {
+    "AWS":   {"ALL_PURPOSE": 0.55, "JOBS": 0.20, "DLT": 0.36, "SQL": 0.22},
+    "Azure": {"ALL_PURPOSE": 0.55, "JOBS": 0.20, "DLT": 0.36, "SQL": 0.22},
+    "GCP":   {"ALL_PURPOSE": 0.55, "JOBS": 0.20, "DLT": 0.36, "SQL": 0.22},
 }
-DBU_PRICE_DEFAULT = 0.40   # conservative blended estimate
-
-# ESG constants
-KWH_PER_DBU           = 0.14    # estimated: r5.2xlarge ~100W, ~0.7 DBUs/node-hr → ~0.14 kWh/DBU
-KG_CO2_PER_KWH        = 0.386   # US EPA eGRID 2022 national average
-TREES_KG_CO2_PER_YEAR = 21.77   # USDA Forest Service average (48 lbs/year)
+DBU_PRICE         = CLOUD_DBU_DEFAULTS["AWS"]  # default; overridden at runtime by sidebar
+DBU_PRICE_DEFAULT = 0.40                        # blended fallback for unknown product types
 
 
 def _sql(warehouse_id: str, stmt: str) -> pd.DataFrame:
@@ -57,9 +49,34 @@ def _is_live(warehouse_id: str) -> bool:
     return bool(warehouse_id) and _HAS_SDK
 
 
+def get_workspace_info(warehouse_id: str = "") -> dict:
+    """
+    Returns the workspace host URL and detected cloud provider.
+    Cloud is inferred from the host pattern:
+      - *.azuredatabricks.net  → Azure
+      - *.gcp.databricks.com   → GCP
+      - everything else        → AWS
+    Falls back to {"host": "", "cloud": "AWS"} on any error.
+    """
+    if _is_live(warehouse_id):
+        try:
+            w    = WorkspaceClient()
+            host = (w.config.host or "").rstrip("/")
+            if "azuredatabricks" in host:
+                cloud = "Azure"
+            elif "gcp.databricks" in host:
+                cloud = "GCP"
+            else:
+                cloud = "AWS"
+            return {"host": host, "cloud": cloud}
+        except Exception:
+            pass
+    return {"host": "", "cloud": "AWS"}
+
+
 # ── DBU Waste ─────────────────────────────────────────────────────────────────
-# system.billing.usage  × system.compute.clusters
-# DBU price source: databricks.com/product/pricing (ALL_PURPOSE AWS list price)
+# system.billing.usage × system.compute.clusters
+# estimated_cost_usd in SQL uses list prices; the app layer recalculates with user prices.
 
 def get_dbu_waste(warehouse_id: str = "") -> pd.DataFrame:
     if _is_live(warehouse_id):
@@ -89,7 +106,6 @@ def get_dbu_waste(warehouse_id: str = "") -> pd.DataFrame:
     skus   = ["r5.2xlarge","r5.4xlarge","m5d.2xlarge","i3.xlarge","c5.4xlarge"]
     names  = ["etl-prod","ml-training","adhoc-analysis","dlt-pipeline","feature-eng",
               "data-science-ws","batch-scoring","report-refresh"]
-    now    = datetime.now()
     rows   = []
     for i in range(25):
         dbu = float(rng.uniform(15, 600))
@@ -241,7 +257,7 @@ def get_data_popularity(warehouse_id: str = "") -> pd.DataFrame:
 
 # ── Billing Trend ──────────────────────────────────────────────────────────────
 # system.billing.usage
-# Cost = usage_quantity × per-product list price
+# estimated_cost_usd here uses list prices; app layer recalculates with user prices.
 
 def get_billing_trend(warehouse_id: str = "") -> pd.DataFrame:
     if _is_live(warehouse_id):
