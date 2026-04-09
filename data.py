@@ -34,10 +34,15 @@ DBU_PRICE_DEFAULT = 0.40                        # blended fallback for unknown p
 
 
 def _sql(warehouse_id: str, stmt: str) -> pd.DataFrame:
+    import time
     w    = WorkspaceClient()
     resp = w.statement_execution.execute_statement(
-        warehouse_id=warehouse_id, statement=stmt, wait_timeout="60s"
+        warehouse_id=warehouse_id, statement=stmt, wait_timeout="50s"
     )
+    # API max wait is 50s; poll until terminal state for longer queries
+    while resp.status.state in (StatementState.PENDING, StatementState.RUNNING):
+        time.sleep(3)
+        resp = w.statement_execution.get_statement(resp.statement_id)
     if resp.status.state != StatementState.SUCCEEDED:
         raise RuntimeError(resp.status.error.message)
     cols = [c.name for c in resp.manifest.schema.columns]
