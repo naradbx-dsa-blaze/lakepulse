@@ -19,6 +19,8 @@ resources:
           - "8080"
           - --server.address
           - 0.0.0.0
+          - --server.headless
+          - "true"
       permissions:
         - level: CAN_USE
           group_name: users
