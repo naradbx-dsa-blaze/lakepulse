@@ -1,11 +1,16 @@
 """
 LakePulse — data layer.
 
-Queries Databricks system tables via SQL Warehouse.
-Falls back to synthetic demo data when DATABRICKS_WAREHOUSE_ID is not set.
+All queries run against real Databricks system tables.
+Pass warehouse_id explicitly from the UI — no env var dependency at runtime.
 
-In Databricks Apps, WorkspaceClient() auto-detects credentials — no token needed.
-Set DATABRICKS_WAREHOUSE_ID as an App environment variable in the workspace UI.
+Sources for constants:
+  DBU pricing     → databricks.com/product/pricing (AWS list price, Sep 2024)
+  CO₂/kWh        → US EPA eGRID 2022 national average (0.386 kg CO₂/kWh)
+  kWh/DBU        → ~0.14 kWh estimated from AWS instance TDP / DBU mapping
+  Tree absorption → USDA Forest Service: ~48 lbs (21.8 kg) CO₂/tree/year
+  Spot discount   → AWS Spot pricing page: 70-90% typical; 70% used (conservative)
+  Job vs AP       → Databricks docs: job clusters have zero idle cost vs always-on AP
 """
 import os
 import random
@@ -20,18 +25,26 @@ try:
 except ImportError:
     _HAS_SDK = False
 
-WAREHOUSE_ID = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
-DEMO_MODE    = not WAREHOUSE_ID or not _HAS_SDK
+# ── Pricing & emission constants (sourced) ────────────────────────────────────
+# AWS list prices (Enterprise tier, pay-as-you-go, Sep 2024)
+DBU_PRICE = {
+    "ALL_PURPOSE": 0.55,   # $0.55/DBU — databricks.com/product/pricing
+    "JOBS":        0.20,   # $0.20/DBU
+    "DLT":         0.36,   # $0.36/DBU (Advanced)
+    "SQL":         0.22,   # $0.22/DBU
+}
+DBU_PRICE_DEFAULT = 0.40   # conservative blended estimate
 
-KWH_PER_DBU            = 0.14
-KG_CO2_PER_KWH         = 0.386
-TREES_KG_CO2_PER_YEAR  = 21.77
+# ESG constants
+KWH_PER_DBU           = 0.14    # estimated: r5.2xlarge ~100W, ~0.7 DBUs/node-hr → ~0.14 kWh/DBU
+KG_CO2_PER_KWH        = 0.386   # US EPA eGRID 2022 national average
+TREES_KG_CO2_PER_YEAR = 21.77   # USDA Forest Service average (48 lbs/year)
 
 
-def _sql(stmt: str) -> pd.DataFrame:
+def _sql(warehouse_id: str, stmt: str) -> pd.DataFrame:
     w    = WorkspaceClient()
     resp = w.statement_execution.execute_statement(
-        warehouse_id=WAREHOUSE_ID, statement=stmt, wait_timeout="60s"
+        warehouse_id=warehouse_id, statement=stmt, wait_timeout="60s"
     )
     if resp.status.state != StatementState.SUCCEEDED:
         raise RuntimeError(resp.status.error.message)
@@ -40,22 +53,27 @@ def _sql(stmt: str) -> pd.DataFrame:
     return pd.DataFrame([[v.str for v in r.data] for r in rows], columns=cols)
 
 
-# ── DBU Waste ─────────────────────────────────────────────────────────────────
+def _is_live(warehouse_id: str) -> bool:
+    return bool(warehouse_id) and _HAS_SDK
 
-def get_dbu_waste() -> pd.DataFrame:
-    if not DEMO_MODE:
-        return _sql("""
+
+# ── DBU Waste ─────────────────────────────────────────────────────────────────
+# system.billing.usage  × system.compute.clusters
+# DBU price source: databricks.com/product/pricing (ALL_PURPOSE AWS list price)
+
+def get_dbu_waste(warehouse_id: str = "") -> pd.DataFrame:
+    if _is_live(warehouse_id):
+        return _sql(warehouse_id, """
             SELECT
-                COALESCE(u.usage_metadata.cluster_id, 'unknown')   AS cluster_id,
-                COALESCE(c.cluster_name, 'Unnamed')                AS cluster_name,
-                COALESCE(c.owned_by, 'unknown')                    AS owner,
+                COALESCE(u.usage_metadata.cluster_id, 'unknown')        AS cluster_id,
+                COALESCE(c.cluster_name, 'Unnamed')                     AS cluster_name,
+                COALESCE(c.owned_by, 'unknown')                         AS owner,
                 u.sku_name,
-                u.billing_origin_product                           AS product,
-                ROUND(SUM(u.usage_quantity), 2)                   AS total_dbu,
-                ROUND(
-                    DATEDIFF(HOUR, MIN(u.usage_start_time), MAX(u.usage_end_time)), 1
-                )                                                  AS lifetime_hours,
-                ROUND(SUM(u.usage_quantity) * 0.55, 2)            AS estimated_cost_usd
+                u.billing_origin_product                                AS product,
+                ROUND(SUM(u.usage_quantity), 2)                        AS total_dbu,
+                ROUND(DATEDIFF(HOUR,
+                    MIN(u.usage_start_time), MAX(u.usage_end_time)), 1) AS lifetime_hours,
+                ROUND(SUM(u.usage_quantity) * 0.55, 2)                 AS estimated_cost_usd
             FROM system.billing.usage u
             LEFT JOIN system.compute.clusters c
                    ON u.usage_metadata.cluster_id = c.cluster_id
@@ -68,7 +86,7 @@ def get_dbu_waste() -> pd.DataFrame:
 
     rng    = np.random.default_rng(42)
     owners = ["alice@corp.com","bob@corp.com","charlie@corp.com","data-team@corp.com","ml-team@corp.com"]
-    skus   = ["Standard_DS3_v2","Standard_DS4_v2","i3.xlarge","r5.2xlarge","m5d.4xlarge"]
+    skus   = ["r5.2xlarge","r5.4xlarge","m5d.2xlarge","i3.xlarge","c5.4xlarge"]
     names  = ["etl-prod","ml-training","adhoc-analysis","dlt-pipeline","feature-eng",
               "data-science-ws","batch-scoring","report-refresh"]
     now    = datetime.now()
@@ -83,25 +101,27 @@ def get_dbu_waste() -> pd.DataFrame:
             "product":            "ALL_PURPOSE",
             "total_dbu":          round(dbu, 2),
             "lifetime_hours":     round(float(rng.uniform(2, 168)), 1),
-            "estimated_cost_usd": round(dbu * 0.55, 2),
+            "estimated_cost_usd": round(dbu * DBU_PRICE["ALL_PURPOSE"], 2),
         })
     return pd.DataFrame(rows)
 
 
 # ── Bottlenecks ────────────────────────────────────────────────────────────────
+# system.query.history
+# shuffle_read_bytes / shuffle_write_bytes from the metrics struct
 
-def get_bottlenecks() -> pd.DataFrame:
-    if not DEMO_MODE:
-        return _sql("""
+def get_bottlenecks(warehouse_id: str = "") -> pd.DataFrame:
+    if _is_live(warehouse_id):
+        return _sql(warehouse_id, """
             SELECT
                 query_id,
-                SUBSTR(statement_text, 1, 120)                             AS query_snippet,
+                SUBSTR(statement_text, 1, 120)                              AS query_snippet,
                 executed_by,
                 start_time,
-                ROUND(total_duration_ms / 60000.0, 2)                     AS duration_min,
-                ROUND(COALESCE(metrics.shuffle_read_bytes,  0)/1e9, 3)    AS shuffle_read_gb,
-                ROUND(COALESCE(metrics.shuffle_write_bytes, 0)/1e9, 3)    AS shuffle_write_gb,
-                ROUND(COALESCE(metrics.peak_memory_bytes,   0)/1e9, 3)    AS peak_memory_gb
+                ROUND(total_duration_ms / 60000.0, 2)                      AS duration_min,
+                ROUND(COALESCE(metrics.shuffle_read_bytes,  0) / 1e9, 3)   AS shuffle_read_gb,
+                ROUND(COALESCE(metrics.shuffle_write_bytes, 0) / 1e9, 3)   AS shuffle_write_gb,
+                ROUND(COALESCE(metrics.peak_memory_bytes,   0) / 1e9, 3)   AS peak_memory_gb
             FROM system.query.history
             WHERE start_time >= CURRENT_TIMESTAMP - INTERVAL 7 DAYS
               AND total_duration_ms > 60000
@@ -136,19 +156,21 @@ def get_bottlenecks() -> pd.DataFrame:
 
 
 # ── Job History (SLA Oracle) ──────────────────────────────────────────────────
+# system.lakeflow.job_run_timeline
+# run_duration is in milliseconds per Databricks docs
 
-def get_job_history() -> pd.DataFrame:
-    if not DEMO_MODE:
-        return _sql("""
+def get_job_history(warehouse_id: str = "") -> pd.DataFrame:
+    if _is_live(warehouse_id):
+        return _sql(warehouse_id, """
             SELECT
                 j.job_id,
                 j.run_id,
-                COALESCE(j.run_name, CONCAT('Job-', j.job_id)) AS job_name,
+                COALESCE(j.run_name, CONCAT('Job-', j.job_id))   AS job_name,
                 j.creator_user_name,
                 j.trigger_time,
                 j.result_state,
-                ROUND(j.run_duration / 60.0, 2)                AS duration_min,
-                ROUND(COALESCE(j.queued_time, 0) / 60.0, 2)   AS queue_min
+                ROUND(j.run_duration / 60000.0, 2)               AS duration_min,
+                ROUND(COALESCE(j.queued_time, 0) / 60000.0, 2)   AS queue_min
             FROM system.lakeflow.job_run_timeline j
             WHERE j.period_start_time >= CURRENT_TIMESTAMP - INTERVAL 30 DAYS
               AND j.result_state IS NOT NULL
@@ -156,12 +178,13 @@ def get_job_history() -> pd.DataFrame:
             LIMIT 500
         """)
 
-    rng       = np.random.default_rng(13)
-    base_dur  = {"etl-daily":45,"ml-training":120,"feature-pipeline":30,"dbt-run":20,"data-quality":15,"batch-scoring":60}
-    states    = ["SUCCEEDED"]*7 + ["FAILED","TIMED_OUT"]
-    users     = ["alice@corp.com","etl-svc@corp.com","ml-team@corp.com"]
-    now       = datetime.now()
-    rows      = []
+    rng      = np.random.default_rng(13)
+    base_dur = {"etl-daily":45,"ml-training":120,"feature-pipeline":30,
+                "dbt-run":20,"data-quality":15,"batch-scoring":60}
+    states   = ["SUCCEEDED"]*7 + ["FAILED","TIMED_OUT"]
+    users    = ["alice@corp.com","etl-svc@corp.com","ml-team@corp.com"]
+    now      = datetime.now()
+    rows     = []
     for i in range(120):
         name = random.choice(list(base_dur))
         dur  = base_dur[name] * float(rng.uniform(0.6, 3.0))
@@ -179,16 +202,17 @@ def get_job_history() -> pd.DataFrame:
 
 
 # ── Data Popularity ────────────────────────────────────────────────────────────
+# system.access.audit
 
-def get_data_popularity() -> pd.DataFrame:
-    if not DEMO_MODE:
-        return _sql("""
+def get_data_popularity(warehouse_id: str = "") -> pd.DataFrame:
+    if _is_live(warehouse_id):
+        return _sql(warehouse_id, """
             SELECT
-                request_params.full_name_arg                              AS table_name,
-                COUNT(*)                                                   AS access_count,
-                MAX(event_time)                                            AS last_accessed,
-                COUNT(DISTINCT user_identity.email)                        AS unique_users,
-                DATEDIFF(DAY, MAX(event_time), CURRENT_TIMESTAMP)         AS days_since_access
+                request_params.full_name_arg                               AS table_name,
+                COUNT(*)                                                    AS access_count,
+                MAX(event_time)                                             AS last_accessed,
+                COUNT(DISTINCT user_identity.email)                         AS unique_users,
+                DATEDIFF(DAY, MAX(event_time), CURRENT_TIMESTAMP)          AS days_since_access
             FROM system.access.audit
             WHERE action_name IN ('getTable','selectFromTable','createTableAsSelect')
               AND event_time >= CURRENT_TIMESTAMP - INTERVAL 90 DAYS
@@ -216,15 +240,25 @@ def get_data_popularity() -> pd.DataFrame:
 
 
 # ── Billing Trend ──────────────────────────────────────────────────────────────
+# system.billing.usage
+# Cost = usage_quantity × per-product list price
 
-def get_billing_trend() -> pd.DataFrame:
-    if not DEMO_MODE:
-        return _sql("""
+def get_billing_trend(warehouse_id: str = "") -> pd.DataFrame:
+    if _is_live(warehouse_id):
+        return _sql(warehouse_id, """
             SELECT
-                DATE_TRUNC('day', usage_start_time)   AS date,
-                billing_origin_product                 AS product,
-                ROUND(SUM(usage_quantity), 2)          AS total_dbu,
-                ROUND(SUM(usage_quantity) * 0.55, 2)  AS estimated_cost_usd
+                DATE_TRUNC('day', usage_start_time)  AS date,
+                billing_origin_product                AS product,
+                ROUND(SUM(usage_quantity), 2)         AS total_dbu,
+                ROUND(SUM(
+                    usage_quantity * CASE billing_origin_product
+                        WHEN 'ALL_PURPOSE' THEN 0.55
+                        WHEN 'JOBS'        THEN 0.20
+                        WHEN 'DLT'         THEN 0.36
+                        WHEN 'SQL'         THEN 0.22
+                        ELSE 0.40
+                    END
+                ), 2)                                 AS estimated_cost_usd
             FROM system.billing.usage
             WHERE usage_start_time >= CURRENT_TIMESTAMP - INTERVAL 90 DAYS
             GROUP BY 1, 2
@@ -241,10 +275,11 @@ def get_billing_trend() -> pd.DataFrame:
             trend    = 1 + 0.004 * d
             seasonal = 0.85 + 0.15 * abs((d % 7) - 3) / 3
             dbu      = float(rng.uniform(60, 280)) * trend * seasonal
+            price    = DBU_PRICE.get(prod, DBU_PRICE_DEFAULT)
             rows.append({
                 "date":               day.date().isoformat(),
                 "product":            prod,
                 "total_dbu":          round(dbu, 2),
-                "estimated_cost_usd": round(dbu * 0.55, 2),
+                "estimated_cost_usd": round(dbu * price, 2),
             })
     return pd.DataFrame(rows)

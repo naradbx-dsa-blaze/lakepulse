@@ -1,6 +1,5 @@
 """
 LakePulse — Native Databricks FinOps Suite
-Single-file Streamlit app with tabs (no subdirectories for Databricks Apps compatibility).
 """
 import os
 import sys
@@ -17,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data import (
     get_billing_trend, get_dbu_waste, get_job_history,
     get_bottlenecks, get_data_popularity,
-    KWH_PER_DBU, KG_CO2_PER_KWH, TREES_KG_CO2_PER_YEAR, DEMO_MODE,
+    KWH_PER_DBU, KG_CO2_PER_KWH, TREES_KG_CO2_PER_YEAR, DBU_PRICE, _is_live,
 )
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -32,20 +31,42 @@ st.markdown("""
 ORANGE = "#FF6B35"; RED = "#E63946"; GREEN = "#2DC653"; BLUE = "#457B9D"
 PALETTE = [ORANGE, BLUE, GREEN, "#A8DADC", "#E9C46A", "#F1FAEE"]
 
+# ── Sidebar — configuration ────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚡ LakePulse")
+    st.markdown("---")
+    st.markdown("### 🔌 Connection")
+    warehouse_id = st.text_input(
+        "SQL Warehouse ID",
+        value=os.getenv("DATABRICKS_WAREHOUSE_ID", ""),
+        help="Databricks → SQL Warehouses → your warehouse → Connection Details tab",
+    )
+    if _is_live(warehouse_id):
+        st.success("Connected to live system tables")
+    else:
+        st.warning("No warehouse ID — showing demo data")
+
+    st.markdown("---")
+    st.markdown("### 💡 Metric Sources")
+    st.caption("**DBU pricing** — Databricks.com/product/pricing (AWS list, Sep 2024)")
+    st.caption("**CO₂/kWh** — US EPA eGRID 2022 national avg: 0.386 kg CO₂/kWh")
+    st.caption("**kWh/DBU** — Est. ~0.14 kWh based on AWS instance TDP / DBU mapping")
+    st.caption("**Tree offset** — USDA Forest Service: ~48 lbs (21.8 kg) CO₂/tree/year")
+    st.caption("**Spot discount** — AWS Spot Advisor: 70-90% typical savings (70% used)")
+    st.caption("**Job cluster savings** — Databricks best practices: zero idle cost vs always-on AP")
+
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown("## ⚡ LakePulse")
-st.caption("Native Databricks FinOps · Kill DBU waste · Predict SLA breaches · Track ESG")
-if DEMO_MODE:
-    st.info("📊 **Demo mode** — set `DATABRICKS_WAREHOUSE_ID` as an App environment variable to connect to real system tables.", icon="ℹ️")
+st.caption("Native Databricks FinOps · system.billing.usage · system.compute.clusters · system.query.history · system.lakeflow.job_run_timeline · system.access.audit")
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
-def load_all():
-    billing    = get_billing_trend()
-    waste      = get_dbu_waste()
-    jobs       = get_job_history()
-    bottleneck = get_bottlenecks()
-    popularity = get_data_popularity()
+def load_all(wh: str):
+    billing    = get_billing_trend(wh)
+    waste      = get_dbu_waste(wh)
+    jobs       = get_job_history(wh)
+    bottleneck = get_bottlenecks(wh)
+    popularity = get_data_popularity(wh)
     for df, cols in [
         (billing,    ["total_dbu","estimated_cost_usd"]),
         (waste,      ["total_dbu","estimated_cost_usd","lifetime_hours"]),
@@ -55,12 +76,16 @@ def load_all():
     ]:
         for c in cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    billing["date"]       = pd.to_datetime(billing["date"], errors="coerce")
-    jobs["trigger_time"]  = pd.to_datetime(jobs["trigger_time"], errors="coerce")
+    billing["date"]      = pd.to_datetime(billing["date"], errors="coerce")
+    jobs["trigger_time"] = pd.to_datetime(jobs["trigger_time"], errors="coerce")
     return billing, waste, jobs, bottleneck, popularity
 
-with st.spinner("Loading telemetry..."):
-    billing, waste, jobs, bottleneck, popularity = load_all()
+with st.spinner("Loading telemetry from system tables..."):
+    try:
+        billing, waste, jobs, bottleneck, popularity = load_all(warehouse_id)
+    except Exception as e:
+        st.error(f"Failed to query system tables: {e}")
+        st.stop()
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
 t0, t1, t2, t3, t4, t5, t6 = st.tabs([
@@ -81,10 +106,24 @@ with t0:
     carbon_t   = billing["total_dbu"].sum() * KWH_PER_DBU * KG_CO2_PER_KWH / 1000
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("💰 MTD Spend",         f"${cur_month:,.0f}",    f"${cur_month - prev_month:+,.0f} vs last month")
-    c2.metric("🔥 Recoverable Waste", f"${waste_cost:,.0f}",   f"{len(waste)} clusters", delta_color="inverse")
-    c3.metric("⚠️ Job Failure Rate",  f"{fail_rate:.1f}%",     f"{int(failed)} failed", delta_color="inverse")
-    c4.metric("🌱 Carbon (90d)",       f"{carbon_t:.2f} tCO₂", "indicative")
+    c1.metric("💰 MTD Spend",
+              f"${cur_month:,.0f}",
+              f"${cur_month - prev_month:+,.0f} vs last month",
+              help="Source: system.billing.usage. Cost = DBUs × per-product list price (databricks.com/product/pricing)")
+    c2.metric("🔥 Recoverable Waste",
+              f"${waste_cost:,.0f}",
+              f"{len(waste)} ALL_PURPOSE clusters",
+              delta_color="inverse",
+              help="ALL_PURPOSE DBU spend last 30 days. $0.55/DBU AWS list price (Databricks pricing page)")
+    c3.metric("⚠️ Job Failure Rate",
+              f"{fail_rate:.1f}%",
+              f"{int(failed)} failed runs",
+              delta_color="inverse",
+              help="Source: system.lakeflow.job_run_timeline. Includes FAILED + TIMED_OUT states.")
+    c4.metric("🌱 Carbon Footprint (90d)",
+              f"{carbon_t:.2f} tCO₂",
+              "indicative estimate",
+              help="Est. = DBUs × 0.14 kWh/DBU × 0.386 kg CO₂/kWh (EPA eGRID 2022). Divide by 1000 for tonnes.")
 
     st.markdown("---")
     cl, cr = st.columns(2)
@@ -93,13 +132,13 @@ with t0:
         fig = px.area(daily, x="date", y="estimated_cost_usd", color="product",
                       color_discrete_sequence=PALETTE,
                       labels={"estimated_cost_usd":"Cost (USD)","date":"","product":"Product"},
-                      title="Daily Spend by Product (90 days)")
+                      title="Daily Spend by Product — Last 90 Days (system.billing.usage)")
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=40,b=0), legend=dict(orientation="h",y=-0.2))
         st.plotly_chart(fig, use_container_width=True)
     with cr:
         by_prod = billing.groupby("product")["estimated_cost_usd"].sum().reset_index()
         fig = px.pie(by_prod, values="estimated_cost_usd", names="product",
-                     hole=0.45, color_discrete_sequence=PALETTE, title="Spend Mix")
+                     hole=0.45, color_discrete_sequence=PALETTE, title="Spend Mix by Product")
         fig.update_traces(textinfo="percent+label")
         fig.update_layout(height=300, margin=dict(l=0,r=0,t=40,b=0), showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
@@ -109,7 +148,7 @@ with t0:
                  orientation="h", color="estimated_cost_usd",
                  color_continuous_scale=[GREEN,ORANGE,RED],
                  labels={"estimated_cost_usd":"USD","y":""},
-                 title="Top 10 Wasteful Clusters")
+                 title="Top 10 Wasteful Clusters — Last 30 Days (system.billing.usage × system.compute.clusters)")
     fig.update_layout(height=320, coloraxis_showscale=False, margin=dict(l=0,r=0,t=40,b=0))
     st.plotly_chart(fig, use_container_width=True)
 
@@ -119,15 +158,17 @@ with t0:
 # ══════════════════════════════════════════════════════════════════════════════
 with t1:
     st.subheader("💰 DBU Waste Killer")
-    st.caption("Surfaces ALL_PURPOSE clusters burning DBUs with low utilisation · system.billing.usage + system.compute.clusters · Last 30 days")
+    st.caption("Source: **system.billing.usage** × **system.compute.clusters** · ALL_PURPOSE clusters · Last 30 days · Price: $0.55/DBU (AWS list, databricks.com/product/pricing)")
 
-    min_cost = st.slider("Min Cost (USD)", 0, 500, 20, 10, key="w_slider")
+    min_cost = st.slider("Min Cost Threshold (USD)", 0, 500, 20, 10, key="w_slider")
     df_w = waste[waste["estimated_cost_usd"] >= min_cost].copy()
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("💸 Recoverable",      f"${df_w['estimated_cost_usd'].sum():,.0f}")
-    c2.metric("🔴 Critical (≥$500)", str(int((df_w["estimated_cost_usd"] >= 500).sum())), delta_color="inverse")
-    c3.metric("📦 Total DBU",         f"{df_w['total_dbu'].sum():,.0f}")
+    c1.metric("💸 Recoverable Spend",   f"${df_w['estimated_cost_usd'].sum():,.0f}",
+              help="ALL_PURPOSE DBU spend × $0.55/DBU (Databricks AWS list price)")
+    c2.metric("🔴 Critical (≥ $500)",   str(int((df_w["estimated_cost_usd"] >= 500).sum())),
+              delta_color="inverse")
+    c3.metric("📦 Total DBU Consumed",   f"{df_w['total_dbu'].sum():,.0f}")
 
     cl, cr = st.columns(2)
     with cl:
@@ -149,9 +190,9 @@ with t1:
     def _sev(v):
         return "🔴 Critical" if v>=500 else ("🟠 High" if v>=100 else ("🟡 Medium" if v>=20 else "🟢 Low"))
     def _act(r):
-        if r["estimated_cost_usd"]>=500: return "Terminate immediately"
-        if r["estimated_cost_usd"]>=100: return "Set auto-termination ≤ 30 min"
-        return "Review utilisation"
+        if r["estimated_cost_usd"] >= 500: return "Terminate cluster immediately"
+        if r["estimated_cost_usd"] >= 100: return "Set autotermination ≤ 30 min via cluster policy"
+        return "Review utilisation patterns"
 
     df_w["severity"] = df_w["estimated_cost_usd"].apply(_sev)
     df_w["action"]   = df_w.apply(_act, axis=1)
@@ -164,7 +205,7 @@ with t1:
           .style.format({"DBU":"{:.1f}","Cost (USD)":"${:.2f}","Lifetime (hrs)":"{:.0f}"}),
         use_container_width=True, hide_index=True, height=400,
     )
-    st.success(f"✅ Applying all actions saves **${df_w['estimated_cost_usd'].sum():,.0f}** in the next 30 days.")
+    st.success(f"✅ Acting on this list recovers **${df_w['estimated_cost_usd'].sum():,.0f}** over the next 30 days.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -172,12 +213,14 @@ with t1:
 # ══════════════════════════════════════════════════════════════════════════════
 with t2:
     st.subheader("🔥 Bottleneck Detector")
-    st.caption("Shuffle spill & data skew from system.query.history · Last 7 days")
+    st.caption("Source: **system.query.history** · Queries > 60 s · Last 7 days · shuffle_read_bytes & peak_memory_bytes from the metrics struct")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("🔍 Queries Analysed", str(len(bottleneck)))
-    c2.metric("⚠️ Total Spill",      f"{bottleneck['shuffle_read_gb'].sum():.1f} GB")
-    c3.metric("⏱️ Slowest Query",    f"{bottleneck['duration_min'].max():.0f} min")
+    c2.metric("⚠️ Total Shuffle Spill", f"{bottleneck['shuffle_read_gb'].sum():.1f} GB",
+              help="shuffle_read_bytes from system.query.history.metrics. Any spill to disk degrades performance; >10 GB is severe.")
+    c3.metric("⏱️ Slowest Query", f"{bottleneck['duration_min'].max():.0f} min",
+              help="total_duration_ms / 60000 from system.query.history")
 
     cl, cr = st.columns(2)
     with cl:
@@ -187,7 +230,8 @@ with t2:
                          color_discrete_sequence=PALETTE,
                          labels={"duration_min":"Duration (min)","shuffle_read_gb":"Shuffle Read (GB)"},
                          title="Shuffle Spill vs Duration")
-        fig.add_hline(y=10, line_dash="dot", line_color=RED, annotation_text="10 GB threshold")
+        fig.add_hline(y=10, line_dash="dot", line_color=RED,
+                      annotation_text="10 GB — severe spill threshold")
         fig.update_layout(height=360, margin=dict(l=0,r=0,t=40,b=0))
         st.plotly_chart(fig, use_container_width=True)
     with cr:
@@ -199,9 +243,9 @@ with t2:
         st.plotly_chart(fig, use_container_width=True)
 
     def _fix(r):
-        if r["shuffle_read_gb"] > 20: return "🔴 Severe Spill — repartition or check cartesian join; enable AQE"
-        if r["shuffle_read_gb"] > 5:  return "🟠 High Shuffle — set spark.sql.adaptive.enabled=true"
-        if r["peak_memory_gb"] > 16:  return "🟡 Memory Pressure — increase executor memory or broadcast join"
+        if r["shuffle_read_gb"] > 20: return "🔴 Severe Spill — check for cartesian join / skewed keys; enable AQE (spark.sql.adaptive.enabled=true)"
+        if r["shuffle_read_gb"] > 5:  return "🟠 High Shuffle — enable AQE; consider REPARTITION hint or salting skewed keys"
+        if r["peak_memory_gb"] > 16:  return "🟡 Memory Pressure — increase executor memory or use broadcast join for smaller table"
         return "🟢 Monitor"
 
     bottleneck["diagnosis"] = bottleneck.apply(_fix, axis=1)
@@ -223,11 +267,13 @@ with t2:
 # ══════════════════════════════════════════════════════════════════════════════
 with t3:
     st.subheader("🔮 SLA Oracle")
-    st.caption("RandomForest classifier on system.lakeflow.job_run_timeline · Predicts delay probability per run")
+    st.caption("Source: **system.lakeflow.job_run_timeline** · RandomForest classifier · SLA = p75 of historical run duration per job · Last 30 days")
 
     @st.cache_resource
-    def train_model():
+    def train_model(wh: str):
         df = jobs.dropna(subset=["duration_min","trigger_time"]).copy()
+        # SLA definition: p75 of each job's historical duration
+        # Jobs running above their own p75 are flagged as "late"
         p75 = df.groupby("job_name")["duration_min"].quantile(0.75).rename("p75")
         df  = df.join(p75, on="job_name")
         df["is_late"]     = (df["duration_min"] > df["p75"]).astype(int)
@@ -248,21 +294,23 @@ with t3:
         imps = pd.Series(clf.feature_importances_, index=feats).sort_values(ascending=False)
         return df, clf.score(X_te, y_te), imps
 
-    with st.spinner("Training SLA Oracle..."):
-        sla_df, accuracy, imps = train_model()
+    with st.spinner("Training SLA Oracle on job run history..."):
+        sla_df, accuracy, imps = train_model(warehouse_id)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🎯 Model Accuracy", f"{accuracy:.1%}")
-    c2.metric("🔴 High Risk",      str(int((sla_df["delay_prob"] >= 0.75).sum())),  delta_color="inverse")
-    c3.metric("🟠 Medium Risk",    str(int(((sla_df["delay_prob"] >= 0.45) & (sla_df["delay_prob"] < 0.75)).sum())), delta_color="inverse")
-    c4.metric("🟢 On Track",       str(int((sla_df["delay_prob"] < 0.45).sum())))
+    c1.metric("🎯 Model Accuracy", f"{accuracy:.1%}",
+              help="Hold-out test set accuracy (80/20 split). Predicts whether a run will exceed its job's p75 historical duration.")
+    c2.metric("🔴 High Risk (≥75%)",  str(int((sla_df["delay_prob"] >= 0.75).sum())), delta_color="inverse")
+    c3.metric("🟠 Medium Risk (≥45%)", str(int(((sla_df["delay_prob"] >= 0.45) & (sla_df["delay_prob"] < 0.75)).sum())), delta_color="inverse")
+    c4.metric("🟢 On Track",           str(int((sla_df["delay_prob"] < 0.45).sum())))
 
     cl, cr = st.columns(2)
     with cl:
         fig = px.histogram(sla_df, x="delay_prob", nbins=20, color_discrete_sequence=[ORANGE],
-                           labels={"delay_prob":"Delay Probability"}, title="Delay Probability Distribution")
-        fig.add_vline(x=0.45, line_dash="dot", line_color=ORANGE, annotation_text="Medium risk")
-        fig.add_vline(x=0.75, line_dash="dot", line_color=RED,    annotation_text="High risk")
+                           labels={"delay_prob":"Delay Probability"},
+                           title="Delay Probability Distribution")
+        fig.add_vline(x=0.45, line_dash="dot", line_color=ORANGE, annotation_text="Medium risk (45%)")
+        fig.add_vline(x=0.75, line_dash="dot", line_color=RED,    annotation_text="High risk (75%)")
         fig.update_layout(height=320, margin=dict(l=0,r=0,t=40,b=0))
         st.plotly_chart(fig, use_container_width=True)
     with cr:
@@ -281,13 +329,15 @@ with t3:
         return "🔴 High Risk" if p>=0.75 else ("🟠 Medium Risk" if p>=0.45 else "🟢 On Track")
 
     at_risk = sla_df[sla_df["delay_prob"] >= 0.45].sort_values("delay_prob",ascending=False).head(20).copy()
-    at_risk["risk"] = at_risk["delay_prob"].apply(_risk)
-    st.subheader("⚠️ At-Risk Runs")
+    at_risk["risk"]  = at_risk["delay_prob"].apply(_risk)
+    at_risk["p75"]   = at_risk["p75"].round(1)
+    st.subheader("⚠️ At-Risk Runs — Predicted to Exceed Job's p75 SLA")
     st.dataframe(
-        at_risk[["job_name","creator_user_name","trigger_time","duration_min","delay_prob","risk"]]
+        at_risk[["job_name","creator_user_name","trigger_time","duration_min","p75","delay_prob","risk"]]
           .rename(columns={"job_name":"Job","creator_user_name":"Owner","trigger_time":"Triggered",
-                           "duration_min":"Duration (min)","delay_prob":"Delay Prob","risk":"Risk"})
-          .style.format({"Duration (min)":"{:.1f}","Delay Prob":"{:.1%}"}),
+                           "duration_min":"Duration (min)","p75":"SLA p75 (min)",
+                           "delay_prob":"Delay Prob","risk":"Risk"})
+          .style.format({"Duration (min)":"{:.1f}","SLA p75 (min)":"{:.1f}","Delay Prob":"{:.1%}"}),
         use_container_width=True, hide_index=True, height=380,
     )
 
@@ -297,7 +347,7 @@ with t3:
 # ══════════════════════════════════════════════════════════════════════════════
 with t4:
     st.subheader("🗺️ Data Popularity Heatmap")
-    st.caption("Table access frequency from system.access.audit · Last 90 days")
+    st.caption("Source: **system.access.audit** · getTable + selectFromTable + createTableAsSelect events · Last 90 days")
 
     unused_days = st.slider("Mark unused after (days)", 7, 90, 30, key="h_slider")
     pop = popularity.copy()
@@ -312,9 +362,11 @@ with t4:
     )
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("📊 Tables Tracked", str(len(pop)))
-    c2.metric("🗑️ Unused",        str(int((pop["days_since_access"] >= unused_days).sum())), delta_color="inverse")
-    c3.metric("🔥 Hot (>100)",    str(int((pop["access_count"] > 100).sum())))
+    c1.metric("📊 Tables Tracked",   str(len(pop)))
+    c2.metric("🗑️ Unused Tables",    str(int((pop["days_since_access"] >= unused_days).sum())),
+              delta_color="inverse",
+              help=f"No access events in system.access.audit for {unused_days}+ days")
+    c3.metric("🔥 Hot Tables (>100)", str(int((pop["access_count"] > 100).sum())))
 
     cl, cr = st.columns([3,2])
     with cl:
@@ -326,30 +378,32 @@ with t4:
             text=pivot_wide.values.astype(int), texttemplate="%{text}",
         ))
         fig.update_layout(height=380, margin=dict(l=0,r=0,t=10,b=0),
-                          xaxis_title="Catalog", yaxis_title="Schema", title="Access Heatmap by Schema")
+                          xaxis_title="Catalog", yaxis_title="Schema",
+                          title="Access Count by Catalog × Schema")
         st.plotly_chart(fig, use_container_width=True)
     with cr:
         top10 = pop.nlargest(10,"access_count").sort_values("access_count")
         fig = px.bar(top10, x="access_count", y=top10["table"].str[:25], orientation="h",
                      color="unique_users", color_continuous_scale=[BLUE,ORANGE],
-                     labels={"access_count":"Accesses","y":"","unique_users":"Users"},
-                     title="Top 10 Hottest Tables")
+                     labels={"access_count":"Access Events","y":"","unique_users":"Unique Users"},
+                     title="Top 10 Most Accessed Tables")
         fig.update_layout(height=380, margin=dict(l=0,r=0,t=40,b=0))
         st.plotly_chart(fig, use_container_width=True)
 
     zombies = pop[pop["status"] == "🔴 Zombie"].sort_values("days_since_access", ascending=False)
-    st.subheader(f"🗑️ Prune Candidates — {len(zombies)} tables unused for {unused_days}+ days")
+    st.subheader(f"🗑️ Prune Candidates — {len(zombies)} tables with < 5 accesses in {unused_days}+ days")
     if len(zombies):
         st.dataframe(
             zombies[["table_name","catalog","schema","access_count","unique_users","days_since_access"]]
               .rename(columns={"table_name":"Full Name","catalog":"Catalog","schema":"Schema",
-                               "access_count":"Accesses","unique_users":"Users","days_since_access":"Days Unused"})
-              .style.format({"Accesses":"{:.0f}","Days Unused":"{:.0f}"}),
+                               "access_count":"Access Events","unique_users":"Unique Users",
+                               "days_since_access":"Days Since Last Access"})
+              .style.format({"Access Events":"{:.0f}","Days Since Last Access":"{:.0f}"}),
             use_container_width=True, hide_index=True, height=320,
         )
-        st.warning(f"⚠️ Drop or archive {len(zombies)} zombie tables to reduce storage costs.")
+        st.warning(f"⚠️ {len(zombies)} zombie tables identified. DROP or ARCHIVE to reduce Delta storage costs.")
     else:
-        st.success("✅ No zombie tables with current threshold.")
+        st.success(f"✅ No zombie tables found with a {unused_days}-day threshold.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -357,7 +411,7 @@ with t4:
 # ══════════════════════════════════════════════════════════════════════════════
 with t5:
     st.subheader("📊 What-If Projections")
-    st.caption("Simulate cost impact of FinOps changes against billing telemetry")
+    st.caption("Source: **system.billing.usage** · Savings modelled from Databricks best practices & AWS/Azure pricing docs")
 
     prev_m   = pd.Timestamp.now().month - 1 if pd.Timestamp.now().month > 1 else 12
     baseline = billing[billing["date"].dt.month == prev_m]["estimated_cost_usd"].sum()
@@ -365,29 +419,35 @@ with t5:
     ca, cb, cc = st.columns(3)
     with ca:
         st.markdown("**Auto-Termination**")
-        at_pct   = st.slider("% clusters covered", 0, 100, 40, 5, key="at")
-        at_red   = st.slider("Idle reduction (%)",  5,  50, 20, 5, key="atr")
+        at_pct = st.slider("% clusters with autotermination ≤ 30 min", 0, 100, 40, 5, key="at",
+                           help="Industry target: ≥80%. Set via cluster policies in Databricks.")
+        at_red = st.slider("Expected idle time reduction (%)", 5, 50, 20, 5, key="atr",
+                           help="Idle ALL_PURPOSE clusters typically waste 20-40% of their DBU budget.")
     with cb:
-        st.markdown("**Spot Instances**")
-        sp_pct   = st.slider("% workloads on Spot", 0, 80, 30, 5, key="sp")
-        sp_disc  = st.slider("Spot discount (%)",   40, 80, 65, 5, key="spd")
+        st.markdown("**Spot / Preemptible Instances**")
+        sp_pct  = st.slider("% workloads migrated to Spot", 0, 80, 30, 5, key="sp",
+                            help="Best for JOBS and DLT. Not recommended for interactive/AP clusters.")
+        sp_disc = st.slider("Spot discount vs On-Demand (%)", 50, 90, 70, 5, key="spd",
+                            help="AWS Spot Advisor shows 70-90% savings for common instance types (r5, m5, c5).")
     with cc:
-        st.markdown("**Job vs All-Purpose**")
-        jb_pct   = st.slider("% moved to Job clusters", 0, 80, 25, 5, key="jb")
-        jb_save  = st.slider("Job cluster savings (%)",  10, 40, 30, 5, key="jbs")
+        st.markdown("**Job Clusters vs All-Purpose**")
+        jb_pct  = st.slider("% AP workloads moved to Job clusters", 0, 80, 25, 5, key="jb",
+                            help="Job clusters terminate after each run — zero idle cost.")
+        jb_save = st.slider("Job cluster savings vs AP (%)", 10, 60, 35, 5, key="jbs",
+                            help="Databricks docs: job clusters typically 30-50% cheaper for scheduled workloads due to no idle billing.")
 
     waste_pool = waste["estimated_cost_usd"].sum()
-    s_at   = waste_pool * (at_pct/100) * (at_red/100)
-    s_sp   = baseline   * (sp_pct/100) * (sp_disc/100)
-    s_jb   = baseline   * (jb_pct/100) * (jb_save/100)
-    total  = s_at + s_sp + s_jb
-    proj   = max(0, baseline - total)
+    s_at  = waste_pool * (at_pct/100) * (at_red/100)
+    s_sp  = baseline   * (sp_pct/100) * (sp_disc/100)
+    s_jb  = baseline   * (jb_pct/100) * (jb_save/100)
+    total = s_at + s_sp + s_jb
+    proj  = max(0, baseline - total)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📌 Baseline",        f"${baseline:,.0f}/mo")
-    c2.metric("💡 Projected",        f"${proj:,.0f}/mo",    f"-${total:,.0f}")
-    c3.metric("📉 Monthly Savings",  f"${total:,.0f}",      f"{total/max(baseline,1)*100:.1f}%")
-    c4.metric("📅 Annual Savings",   f"${total*12:,.0f}")
+    c1.metric("📌 Baseline (last month)",    f"${baseline:,.0f}")
+    c2.metric("💡 Projected Monthly Spend",   f"${proj:,.0f}",    f"-${total:,.0f}")
+    c3.metric("📉 Monthly Savings",           f"${total:,.0f}",   f"{total/max(baseline,1)*100:.1f}%")
+    c4.metric("📅 Projected Annual Savings",  f"${total*12:,.0f}")
 
     st.markdown("---")
     cl, cr = st.columns([3,2])
@@ -404,17 +464,19 @@ with t5:
             textposition="outside",
         ))
         fig.update_layout(height=380, margin=dict(l=0,r=0,t=10,b=0),
-                          yaxis_title="Monthly Cost (USD)", showlegend=False, title="Savings Waterfall")
+                          yaxis_title="Monthly Cost (USD)", showlegend=False,
+                          title="Savings Waterfall")
         st.plotly_chart(fig, use_container_width=True)
     with cr:
-        bd = pd.DataFrame({"Lever":["Auto-Termination","Spot","Job Clusters"],"Saving":[s_at,s_sp,s_jb]})
+        bd = pd.DataFrame({"Lever":["Auto-Termination","Spot Instances","Job Clusters"],
+                           "Saving":[s_at,s_sp,s_jb]})
         fig = px.pie(bd, values="Saving", names="Lever", hole=0.4,
                      color_discrete_sequence=[GREEN,BLUE,ORANGE], title="Savings Mix")
         fig.update_traces(textinfo="percent+label")
         fig.update_layout(height=380, margin=dict(l=0,r=0,t=40,b=0), showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    growth  = st.slider("Monthly workload growth (%)", 0.0, 5.0, 1.5, 0.5, key="gr") / 100
+    growth  = st.slider("Assumed monthly workload growth (%)", 0.0, 5.0, 1.5, 0.5, key="gr") / 100
     months  = pd.date_range(start=pd.Timestamp.now().replace(day=1), periods=12, freq="MS")
     proj_df = pd.DataFrame({
         "Month":     months,
@@ -425,11 +487,11 @@ with t5:
                   x="Month", y="Cost", color="Scenario",
                   color_discrete_map={"Baseline":RED,"Optimised":GREEN},
                   markers=True, labels={"Cost":"Monthly Cost (USD)","Month":""},
-                  title="12-Month Projection")
+                  title="12-Month Cost Projection")
     fig.update_layout(height=300, margin=dict(l=0,r=0,t=40,b=0))
     st.plotly_chart(fig, use_container_width=True)
     cum = sum((baseline - proj) * (1+growth)**i for i in range(12))
-    st.success(f"🎯 Cumulative 12-month savings: **${cum:,.0f}**")
+    st.success(f"🎯 Cumulative 12-month savings with current levers: **${cum:,.0f}**")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -437,7 +499,12 @@ with t5:
 # ══════════════════════════════════════════════════════════════════════════════
 with t6:
     st.subheader("🌱 ESG & Sustainability Tracking")
-    st.caption(f"1 DBU ≈ {KWH_PER_DBU} kWh · US grid avg {KG_CO2_PER_KWH} kg CO₂/kWh · Indicative figures only")
+    st.caption(
+        "Source: **system.billing.usage** · "
+        "kWh/DBU: ~0.14 (AWS instance TDP estimate) · "
+        "CO₂/kWh: 0.386 kg (US EPA eGRID 2022 national avg) · "
+        "Tree offset: 21.8 kg CO₂/year (USDA Forest Service)"
+    )
 
     esg               = billing.copy()
     esg["kwh"]        = esg["total_dbu"] * KWH_PER_DBU
@@ -448,15 +515,18 @@ with t6:
     total_co2   = esg["kg_co2"].sum()
     total_trees = esg["trees_equiv"].sum()
     month_proj  = (total_co2 / 90) * 30
-    budget_kg   = 5000
+    budget_kg   = 5000   # 5 tCO₂/month internal target
     vs_budget   = (month_proj - budget_kg) / budget_kg * 100
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("⚡ Energy (90d)",       f"{total_kwh/1000:.1f} MWh")
-    c2.metric("💨 CO₂ (90d)",          f"{total_co2/1000:.2f} tCO₂")
-    c3.metric("🌳 Trees to Offset",    f"{int(total_trees):,}")
-    c4.metric("📅 Projected Monthly",  f"{month_proj/1000:.2f} tCO₂",
-              f"{vs_budget:+.1f}% vs {budget_kg/1000:.0f}t budget",
+    c1.metric("⚡ Energy Consumed (90d)",   f"{total_kwh/1000:.1f} MWh",
+              help="total_dbu × 0.14 kWh/DBU (estimated from AWS r5/m5 instance TDP)")
+    c2.metric("💨 CO₂ Emitted (90d)",       f"{total_co2/1000:.2f} tCO₂",
+              help="Energy × 0.386 kg CO₂/kWh (US EPA eGRID 2022 national average)")
+    c3.metric("🌳 Trees Needed to Offset",   f"{int(total_trees):,}",
+              help="CO₂ ÷ (21.8 kg CO₂/tree/year ÷ 365 days). Source: USDA Forest Service")
+    c4.metric("📅 Projected Monthly CO₂",   f"{month_proj/1000:.2f} tCO₂",
+              f"{vs_budget:+.1f}% vs {budget_kg/1000:.0f} tCO₂ internal target",
               delta_color="inverse" if vs_budget > 0 else "normal")
 
     st.markdown("---")
@@ -465,31 +535,37 @@ with t6:
         daily = esg.groupby("date").agg(kg_co2=("kg_co2","sum")).reset_index()
         daily["7d_avg"] = daily["kg_co2"].rolling(7, min_periods=1).mean()
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=daily["date"], y=daily["kg_co2"],  name="Daily CO₂",
+        fig.add_trace(go.Bar(x=daily["date"], y=daily["kg_co2"], name="Daily CO₂",
                              marker_color=BLUE, opacity=0.6))
         fig.add_trace(go.Scatter(x=daily["date"], y=daily["7d_avg"], name="7-day Avg",
                                  line=dict(color=ORANGE, width=2)))
-        fig.update_layout(height=320, margin=dict(l=0,r=0,t=10,b=0),
-                          yaxis_title="kg CO₂", legend=dict(orientation="h",y=-0.2),
-                          title="Daily CO₂ Emissions (90 days)")
+        fig.update_layout(height=320, margin=dict(l=0,r=0,t=10,b=0), yaxis_title="kg CO₂",
+                          legend=dict(orientation="h",y=-0.2),
+                          title="Daily CO₂ Emissions — Last 90 Days")
         st.plotly_chart(fig, use_container_width=True)
     with cr:
         by_prod = esg.groupby("product")["kg_co2"].sum().reset_index()
         fig = px.pie(by_prod, values="kg_co2", names="product", hole=0.4,
                      color_discrete_sequence=[GREEN,BLUE,ORANGE,"#E9C46A"],
-                     title="CO₂ by Product")
+                     title="CO₂ Breakdown by Product")
         fig.update_traces(textinfo="percent+label")
         fig.update_layout(height=320, margin=dict(l=0,r=0,t=40,b=0), showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("♻️ Green Recommendations")
-    for title, desc in [
-        ("Spot/Preemptible instances",     "Optimises instance packing, reduces energy per workload by 15-25%."),
-        ("Enable Photon acceleration",     "Same work faster = fewer cluster-hours = less energy. Up to 50% reduction."),
-        ("Tight autoscale bounds",         "Idle nodes waste energy. Match min/max workers to actual workload patterns."),
-        ("Delta OPTIMIZE + ZORDER",        "Fewer scans = shorter queries = lower carbon. Reduce scan time 30-70%."),
-        ("Schedule in low-carbon regions", "us-west-2: 0.18 kg CO₂/kWh vs us-east-1: 0.39 kg CO₂/kWh."),
-    ]:
+    st.subheader("♻️ Green Computing Recommendations")
+    recs = [
+        ("Spot / Preemptible instances",
+         "Better bin-packing in the data center reduces energy per workload. AWS: 70-90% cheaper + lower carbon footprint. Best for JOBS & DLT workloads."),
+        ("Enable Photon acceleration",
+         "Photon completes the same work in fewer CPU cycles → shorter cluster lifetime → less energy. Databricks benchmarks show 2-8× query speedup on common workloads."),
+        ("Tight autoscale bounds",
+         "Idle nodes still draw power. Setting min_workers close to actual demand avoids heating the data center for nothing. Target utilisation ≥ 70%."),
+        ("Delta OPTIMIZE + ZORDER",
+         "Fewer files read per query = shorter query = less CPU time = lower carbon. Reduces data scanned by 30-70% on Z-ordered columns (Databricks docs)."),
+        ("Route batch jobs to low-carbon AWS regions",
+         "AWS us-west-2 (Oregon): ~0.18 kg CO₂/kWh (79% renewable). AWS us-east-1 (N. Virginia): ~0.39 kg CO₂/kWh. Same job, 2× lower footprint. Source: US EPA eGRID + AWS sustainability report."),
+    ]
+    for title, desc in recs:
         with st.container(border=True):
             st.markdown(f"**🌿 {title}**")
             st.caption(desc)
