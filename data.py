@@ -47,7 +47,7 @@ def _sql(warehouse_id: str, stmt: str) -> pd.DataFrame:
         raise RuntimeError(resp.status.error.message)
     cols = [c.name for c in resp.manifest.schema.columns]
     rows = resp.result.data_array or []
-    return pd.DataFrame([[v.str for v in r.data] for r in rows], columns=cols)
+    return pd.DataFrame(rows, columns=cols)
 
 
 def _is_live(warehouse_id: str) -> bool:
