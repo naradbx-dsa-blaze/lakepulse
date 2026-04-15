@@ -704,10 +704,35 @@ def render_waste(data, prices, min_cost):
 
     def _sev(v):
         return "Critical" if v >= 500 else ("High" if v >= 100 else ("Medium" if v >= 20 else "Low"))
+
+    def _dbu_rate(r):
+        """Average DBU/hr — proxy for whether cluster is actively doing work."""
+        hours = max(float(r.get("lifetime_hours", 0) or 0), 0.1)
+        return float(r.get("total_dbu", 0) or 0) / hours
+
     def _act(r):
-        if r["estimated_cost_usd"] >= 500: return "Terminate immediately"
-        if r["estimated_cost_usd"] >= 100: return "Set autotermination ≤ 30 min"
+        cost     = r["estimated_cost_usd"]
+        rate     = _dbu_rate(r)
+        is_idle  = rate < 5    # < 5 DBU/hr → effectively idle / underutilised
+        is_light = rate < 20   # < 20 DBU/hr → light workload
+
+        if cost >= 500:
+            if is_idle:
+                return "Terminate immediately — cluster idle"
+            elif is_light:
+                return "Terminate or switch to job cluster — light load"
+            else:
+                return "Switch to job cluster — active all-purpose cluster"
+        if cost >= 100:
+            if is_idle:
+                return "Set autotermination ≤ 15 min — appears idle"
+            else:
+                return "Set autotermination ≤ 30 min"
+        if cost >= 20:
+            return "Monitor — low activity but cost accumulating"
         return "Review utilisation pattern"
+
+    df["DBU/hr"]   = df.apply(_dbu_rate, axis=1).round(1)
     df["Severity"] = df["estimated_cost_usd"].apply(_sev)
     df["Action"]   = df.apply(_act, axis=1)
 
@@ -729,11 +754,12 @@ def render_waste(data, prices, min_cost):
                   labels={"estimated_cost_usd":"USD","owner":""}, title="Waste by Owner")
     fig2.update_layout(**{**CHART, "coloraxis_showscale": False, "height": 340})
 
-    kill_df = df[["cluster_name","owner","sku_name","total_dbu","lifetime_hours","estimated_cost_usd","Severity","Action"]].copy()
+    kill_df = df[["cluster_name","owner","sku_name","total_dbu","lifetime_hours","DBU/hr","estimated_cost_usd","Severity","Action"]].copy()
     kill_df = kill_df.rename(columns={"cluster_name":"Cluster","owner":"Owner","sku_name":"Instance",
                                        "total_dbu":"DBU","lifetime_hours":"Lifetime (h)",
-                                       "estimated_cost_usd":"Cost (USD)"})
+                                       "DBU/hr":"DBU/hr","estimated_cost_usd":"Cost (USD)"})
     kill_df["DBU"]        = kill_df["DBU"].apply(lambda x: f"{float(x):.1f}")
+    kill_df["DBU/hr"]     = kill_df["DBU/hr"].apply(lambda x: f"{float(x):.1f}")
     kill_df["Cost (USD)"] = kill_df["Cost (USD)"].apply(lambda x: f"${float(x):,.2f}")
 
     return html.Div([
