@@ -1,1 +1,1 @@
-command: ["python", "-m", "streamlit", "run", "app.py", "--server.port", "8000", "--server.address", "0.0.0.0", "--server.headless", "true"]
+command: ["gunicorn", "app:server", "-w", "4", "--worker-class", "gthread", "--threads", "4", "-b", "0.0.0.0:8000", "--timeout", "120"]

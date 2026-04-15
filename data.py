@@ -54,6 +54,22 @@ def _is_live(warehouse_id: str) -> bool:
     return bool(warehouse_id) and _HAS_SDK
 
 
+def validate_connection(warehouse_id: str) -> dict:
+    """
+    Validates the warehouse ID by running SELECT 1 against the cluster.
+    Returns {"ok": True, "host": "...", "cloud": "AWS|Azure|GCP"}
+         or {"ok": False, "error": "..."}.
+    """
+    if not _is_live(warehouse_id):
+        return {"ok": False, "error": "Databricks SDK not available or empty warehouse ID."}
+    try:
+        _sql(warehouse_id.strip(), "SELECT 1")
+        info = get_workspace_info(warehouse_id.strip())
+        return {"ok": True, **info}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def get_workspace_info(warehouse_id: str = "") -> dict:
     """
     Returns the workspace host URL and detected cloud provider.
